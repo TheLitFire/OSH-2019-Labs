@@ -154,6 +154,8 @@ int main(){
     if (listen(serv_sock, SOMAXCONN)==-1) handle_error("listen at main");
     
     signal(SIGCHLD, parent_process_wait);
+    struct sigaction sigact; sigact.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &sigact, NULL) == 0) fprintf(stderr, "SIGPIPE ignore");
     int child_process_num = get_nprocs();
     for (int i = 0; i < child_process_num; ++i){
         if (fork() == 0){
