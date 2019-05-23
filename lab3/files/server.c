@@ -83,7 +83,7 @@ void handle_clnt(int clnt_sock){
         if (write(clnt_sock, response, response_len) == -1) handle_error("write at response");
         ssize_t cur_len;
         char *file_buf = (char *)malloc(MAX_FILE_LEN * sizeof(char)); if (!file_buf) { fprintf(stderr, "malloc FAIL at file_buf\n"); exit(EXIT_FAILURE); }
-        while (cur_len = read(req_file_d, file_buf, (ssize_t)MAX_FILE_LEN)){
+        while ((cur_len = read(req_file_d, file_buf, (ssize_t)MAX_FILE_LEN))){
             if (cur_len == -1) handle_error("read at responce_file");
             if (write(clnt_sock, file_buf, (size_t)cur_len) == -1) handle_error("write at response_file");
         }
@@ -154,8 +154,7 @@ int main(){
     if (listen(serv_sock, SOMAXCONN)==-1) handle_error("listen at main");
     
     signal(SIGCHLD, parent_process_wait);
-    struct sigaction sigact; sigact.sa_handler = SIG_IGN;
-    if (sigaction(SIGPIPE, &sigact, NULL) == 0) fprintf(stderr, "SIGPIPE ignore");
+    signal(SIGPIPE, SIG_IGN);
     int child_process_num = get_nprocs();
     for (int i = 0; i < child_process_num; ++i){
         if (fork() == 0){
