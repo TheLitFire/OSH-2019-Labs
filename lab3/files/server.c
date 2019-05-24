@@ -135,11 +135,6 @@ END_FUNC:
     free(response);
 }
 
-void parent_process_wait(int signal){
-    int status;
-    while (waitpid(-1, &status, WNOHANG) > 0);
-}
-
 void *handle_epoll(void *no_use){
     pthread_t selfid = pthread_self();
     struct epoll_event *events = (struct epoll_event *)malloc(MAX_EVENT_NUM * sizeof(struct epoll_event));
@@ -174,8 +169,7 @@ int main(){
     
     if (bind(serv_sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr))==-1) handle_error("bind at main");
     if (listen(serv_sock, SOMAXCONN)==-1) handle_error("listen at main");
-    
-    signal(SIGCHLD, parent_process_wait);
+
     signal(SIGPIPE, SIG_IGN);
 
     pthread_attr_t pthreadattr;
