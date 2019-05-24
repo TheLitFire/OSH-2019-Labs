@@ -2,11 +2,13 @@
 
 ## 编译选项
 
-本人直接编程在单个文件 server.c 里，要向树莓派环境编译时，只需要添加 `-O2` `--std=c99` 选项即可。
+本人直接编程在单个文件 server.c 里。
+
+要向树莓派环境编译时，需要添加 `-O3` `--std=c99`  `-lpthread` 选项，后两个是为了支持类似 C++ 的 for 循环写法，以及 pthread 安全。
 
 例如，在本人机器上使用 Lab1 所用的交叉编译工具时，编译指令为 :
 ```
-arm-linux-gnueabihf-gcc server.c -o server -O2 --std=c99
+arm-linux-gnueabihf-gcc server.c -o server -O3 --std=c99 -lpthread
 ```
 
 至于运行的话
@@ -23,68 +25,54 @@ arm-linux-gnueabihf-gcc server.c -o server -O2 --std=c99
 - 路径长度不超过 4096 个字符。否则，即使我们将其完整解析，调用 `open` 等函数打开文件时，系统也无法识别它。
 - 后面的 HTTP 请求协议，Host 等是被本实验 ”确保“ 无误的。
 
-也就意味着，我们不必读取完整的请求内容，甚至于只需要读前几千个字符（本人读取了 8192 个字符）。
+也就意味着，虽然 HTTP 协议标准需要我们读完整的请求内容，但我们需要保存的只是前几千个字符（本人保存了 8192 个），后面的循环读取并丢弃即可。
 
 ### 必做：解析和检验 HTTP 头
 
-鉴于 `read` 和 `write` 偶尔出现的，不能读全指定字节数的情况，本人的代码中都包含了诸多 ”循环读取“ 的行为。
+鉴于 `read` 和 `write` 偶尔出现的，不能读全或写全指定字节数的情况，本人的代码中都包含了诸多 ”循环读取“ 的行为。
 
 解析判定包括如下几个部分：
-- 请求内容至多读到 8192 字节，若请求内容总数不足 5 字节，或前5个字节不是 `GET /`，或在 8192 字节内找不到分割 PATH 字段的第二个空格，则判定为 ”500“ 情形。
+- 请求内容至多读并存储到 8192 字节，超过 8192 字节之后的部分被另一个循环读取丢弃掉。若请求内容总数不足 5 字节，或前5个字节不是 `GET /`，或在 8192 字节内找不到分割 PATH 字段的第二个空格，则判定为 ”500“ 情形。
 - 在 PATH 字段内，判定该路径将会到达的层次，中途任何一个时刻企图到达 ”根目录“ （server 所在目录）上层目录的行为（比如 `/123/../../`）被认定非法并返回 ”500“
 - 将 PATH 字段的前一个分割空格替换为 '.' 字符，后一个空格替换为 '\0'，将从'.' 开始的字符串作为路径传递给 `open` 和 `stat` 函数（无视，或者任凭在这个字符串区间内仍有其他 '\0' 字符出现的情况），若 `open` 失败，返回 ”404“；再若 `stat` 返回的状态表明文件不是常规文件（`!S_ISREG(fstatus->st_mode)`），则返回 ”500“。
 - 若一切非法情况都没有发生，则获得目标文件的文件描述符
 
 ### 必做：实现读取请求文件内容
 
-使用 `read` 和 `write` 以及必要的循环，完整读取并写出请求文件的内容。`Content-Length` 响应头在解析请求的时候就已经可以用 `stat` 获得。
+虽然使用 `read` 和 `write` 以及必要的循环，可以做到完整读取并写出请求文件的内容，但是 `sendfile` 函数的效率更高——本人只是更改为这个函数就得到了近两成的效率提升。
+
+`Content-Length` 响应头在解析请求的时候就已经可以用 `stat` 获得，或者对于 404 和 500 的情形，值为 0 。
 
 ### 必做：实现错误和异常处理
 
-在任何导致程序将无法继续下去的函数调用报错（但下面将会提到的 epoll 使用中，一些函数调用报错并不属于这种类型），如 bind 失败，listen 失败，malloc 失败，read、write 失败等会使用 `perror(message)` 报出错误信息并终止程序（或子进程）。
+关于错误和异常处理的实现有一些共性，是基于：
+- 全部的文件描述符被本人设定为阻塞式，故大多数时候（如对 `read` `write`）不会出现返回 `EAGAIN || EWOULDBLOCK` 的情况。
+- 本人设置了 `signal(SIGPIPE, SIG_IGN)` 。故以防任何可以返回 `EINTR` 的函数被它打断，当函数返回此错误时，会继续执行未完成的工作而非停止。
 
-而一些应当不影响程序继续执行的调用错误，则只向 `stderr` 送出信息。
+此外，一切函数出错时（如 `malloc` 失败等），会在输出错误信息，退出当前函数或整个程序前，将关闭应当在该函数关闭的文件描述符、释放内存。
 
-### 必做：多进程；选做：epoll
+当然还有如下两个函数的特殊情况：
 
-获取本机 CPU 的核心数，并创建等量的子进程。每个子进程维护一个 epoll 列表。在每个 epoll 列表里：
-- 被 `listen` 的请求 socket 被 `fcntl` 设定为非阻塞模式，并以 `EPOLLIN` level-triggered 事件模式添加到敏感列表。
-- 当请求 socket 被 `epoll_wait` 获取时，尝试 `accept` 它（若 accept 失败，则什么都不做），否则将 accept 到的服务 socket 以阻塞式，事件模式 `EPOLLEN | EPOLLONESHOT` 添加到敏感列表。
-- 当服务 socket 被获取，执行处理过程。
+#### read 读不满
 
-siege 测试效果：树莓派上运行。
+考量 `read` 不能读够给定字符数的情况，`read` 的返回值除非是 `EINTR` 以外的错误，否则继续读取直到满（或者，比如说对解析请求，读到 `\r\n\r\n` 时终止）。
 
-`-c 5 -r 1`，10M 文件：
+#### write 写不足 或 写错误
 
+定义一个额外的函数
+```C
+size_t write_stable(int fd, const void *buf, size_t count)；
 ```
-Transactions:		           5 hits
-Availability:		      100.00 %
-Elapsed time:		       21.55 secs
-Data transferred:	       50.00 MB
-Response time:		       16.63 secs
-Transaction rate:	        0.23 trans/sec
-Throughput:		        2.32 MB/sec
-Concurrency:		        3.86
-Successful transactions:           5
-Failed transactions:	           0
-Longest transaction:	       21.55
-Shortest transaction:	       13.99
-```
+将不断向 fd 写 buf 所在内存开始的 count 个字符，直到调用 `write` 函数返回除 `EINTR` 以外的错误—— `write_stable` 函数返回 0，否则返回已写字节数。
 
-`-c 100 -r 100`  ，125Byte 文件：
+### 必做：多进程，多线程；选做：epoll，线程池
 
-```
-Transactions:		       10000 hits
-Availability:		      100.00 %
-Elapsed time:		        9.30 secs
-Data transferred:	        1.19 MB
-Response time:		        0.09 secs
-Transaction rate:	     1075.27 trans/sec
-Throughput:		        0.13 MB/sec
-Concurrency:		       96.48
-Successful transactions:       10000
-Failed transactions:	           0
-Longest transaction:	        0.17
-Shortest transaction:	        0.02
+由于多进程不足以充分并发，多进程+多线程开销加大，多进程 epoll + 多线程处理请求会出现许多关于文件描述符传参错乱的问题等，本人最后使用的是 主进程接收请求 + 多线程多 epoll 接收任务 的模式。
 
-```
+对于主进程：
+- 创建 MAX_THREAD_NUM 个进程（本人定义为 16），并为每个进程创建 epoll。
+- 监听请求 socket，当 `accept` 成功时，以 `EPOLLEN | EPOLLONESHOT` 模式，将其依次轮流添加到 16 个进程的 epoll 列表（第 1 个请求给第 1 个线程，第 8 个请求给第 8 个线程，第 18 个 请求给第 2 个线程，......）。
+
+对于每个线程：
+- 通过自己的线程 id，唯一地获得自己所拥有的 epoll 列表。
+- `epoll_wait` 该列表并处理其得到的任务。

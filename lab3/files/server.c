@@ -16,6 +16,7 @@
 #include <sys/sysinfo.h>
 #include <signal.h>
 #include <sys/sendfile.h>
+#include <pthread.h>
 
 #define BIND_IP_ADDR "0.0.0.0"
 #define BIND_PORT 8000
@@ -30,6 +31,11 @@
 #define HTTP_STATUS_404 "404 Not Found"
 #define HTTP_STATUS_500 "500 Internal Server Error"
 
+//variable// set for threads
+pthread_t pthreadid[MAX_THREAD_NUM];
+int epollfd_pool[MAX_THREAD_NUM];
+
+//functions//
 int parse_request(int clnt_sock, char* req, struct stat *fstatus){
     ssize_t req_len = (ssize_t)0;
     const char end_ind[4] = {'\r', '\n', '\r', '\n'}; int ind = 0;
@@ -134,45 +140,30 @@ void parent_process_wait(int signal){
     while (waitpid(-1, &status, WNOHANG) > 0);
 }
 
-void handle_epoll(int serv_sock){
-    struct epoll_event epollev, *events = (struct epoll_event *)malloc(MAX_EVENT_NUM * sizeof(struct epoll_event));
-    if (events == NULL){ fprintf(stderr, "malloc FAIL at handle_epoll\n"); return;} 
-    int epollfd = epoll_create1(0); if (epollfd == -1) { perror("epoll_create1 at handle_epoll"); free(events); return;}
-    epollev.data.fd = serv_sock;
-    epollev.events = EPOLLIN;
-    if (-1 == epoll_ctl(epollfd, EPOLL_CTL_ADD, serv_sock, &epollev)) { perror("epoll_ctl at serv_sock"); free(events); close(epollfd); return;}
-    
-    struct sockaddr_in clnt_addr; socklen_t clnt_size = sizeof(clnt_addr);
-    int nfd, clnt_sock;
-    for (;;){
+void *handle_epoll(void *no_use){
+    pthread_t selfid = pthread_self();
+    struct epoll_event *events = (struct epoll_event *)malloc(MAX_EVENT_NUM * sizeof(struct epoll_event));
+    if (events == NULL){ fprintf(stderr, "malloc at handle_epoll\n"); return NULL;} 
+    int epollfd = -1;
+    for (int i = 0; i < MAX_THREAD_NUM; ++i) if (selfid == pthreadid[i]){
+        epollfd = epollfd_pool[i];
+        break;
+    }
+    if (epollfd == -1) { fprintf(stderr, "epollfd at handle_epoll\n"); return NULL;} 
+    for (int nfd;;){
         if ((nfd = epoll_wait(epollfd, events, MAX_EVENT_NUM, -1)) == -1) {
             perror("epoll_wait"); continue;
         }
         for (int i = 0; i < nfd; ++i){
-            if (events[i].data.fd == serv_sock){
-                clnt_sock = accept(serv_sock, (struct sockaddr *)&clnt_addr, &clnt_size);
-                if (clnt_sock == -1){
-                    //perror("accept");
-                    continue;
-                }else{
-                    //if (fcntl(clnt_sock, F_SETFL, fcntl(clnt_sock, F_GETFD) | O_NONBLOCK) == -1) continue;
-                    epollev.events = EPOLLIN | EPOLLONESHOT;
-                    epollev.data.fd = clnt_sock;
-                    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, clnt_sock, &epollev) == -1){
-                        perror("epoll_ctl at clnt_sock");
-                        close(clnt_sock);
-                    }
-                }
-            }else if (events[i].events & EPOLLIN){
-                handle_clnt(events[i].data.fd);
-            }
+            handle_clnt(events[i].data.fd);
         }
     }
+    free(events);
+    return NULL;
 }
 
 int main(){
     int serv_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); if (serv_sock==-1) handle_error("socket at main");
-    if (fcntl(serv_sock, F_SETFL, O_NONBLOCK) == -1) handle_error("fcntl at main");
     int flag_on = 1;
     if (-1 == setsockopt(serv_sock, SOL_SOCKET, SO_REUSEADDR, &flag_on, sizeof(flag_on))) handle_error("setsocketopt at main");
     
@@ -186,13 +177,25 @@ int main(){
     
     signal(SIGCHLD, parent_process_wait);
     signal(SIGPIPE, SIG_IGN);
-    int child_process_num = get_nprocs();
-    for (int i = 0; i < child_process_num; ++i){
-        if (fork() == 0){
-            handle_epoll(serv_sock);
-            exit(0);
-        }
+
+    pthread_attr_t pthreadattr;
+    pthread_attr_init(&pthreadattr);
+    pthread_attr_setdetachstate(&pthreadattr,PTHREAD_CREATE_DETACHED);
+    for (int i = 0; i < MAX_THREAD_NUM; ++i){
+        if ((epollfd_pool[i] = epoll_create1(0)) == -1) handle_error("epoll_create1 at main");
+        if (pthread_create(&pthreadid[i], &pthreadattr, handle_epoll, NULL) != 0) handle_error("pthread_create at main");
     }
-    while (1) sleep(255);
+    struct sockaddr_in clnt_addr; socklen_t clnt_size = sizeof(clnt_addr);
+    struct epoll_event epollev; int clnt_sock, k = 0;
+    while (1){
+        if ((clnt_sock = accept(serv_sock, (struct sockaddr *)&clnt_addr, &clnt_size)) == -1){
+            perror("accept at main");
+            continue;
+        }
+        epollev.data.fd = clnt_sock;
+        epollev.events = EPOLLIN | EPOLLONESHOT;
+        epoll_ctl(epollfd_pool[k], EPOLL_CTL_ADD, clnt_sock, &epollev);
+        k = (k + 1)% MAX_THREAD_NUM;
+    }
     return 0;
 }
